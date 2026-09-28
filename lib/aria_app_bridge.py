@@ -109,6 +109,13 @@ ARIA_JS = r"""
     enc[s + 32768] = best;
   }
   window.__aria = {state: 'installed', mic: 0, her: 0};
+  // mic shim: ring buffer Python pulls via Runtime.evaluate (CDP bindings
+  // proved unreliable across bridge restarts)
+  window.__micBuf = window.__micBuf || [];
+  window.__ariaMic = (b64) => {
+    window.__micBuf.push(b64);
+    if (window.__micBuf.length > 300) window.__micBuf.splice(0, 150);
+  };
   const a = window.__aria;
 
   // 48k context: her voice -> MediaStreamTrack
@@ -252,7 +259,7 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                 import base64 as b64mod
                 sent = 0
                 t_start = asyncio.get_event_loop().time()
-                greeted = False
+                greeted_seq = 0
                 while True:
                     budget = int((asyncio.get_event_loop().time() - t_start) * 8000)
                     room = budget - sent
@@ -276,8 +283,10 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                     # one-shot greeting once the session is up (proven
                     # pattern from digits_gpt_call — she speaks only
                     # after an explicit kickoff instruction)
-                    if not greeted and state.get("greet_now"):
-                        greeted = True
+                    # per-call greeting: main loop bumps greet_seq on every
+                    # new grabbed call (daemon mode re-greets each call)
+                    if state.get("greet_seq", 0) > greeted_seq:
+                        greeted_seq = state["greet_seq"]
                         try:
                             await conn.session.instructions.append(
                                 event_id=f"go_{uuid.uuid4().hex[:6]}",
@@ -287,7 +296,7 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                                          "'Hey! I'm Aria, the personal "
                                          "assistant. How can I help?' Then "
                                          "pause and listen."))
-                            evlog("GREETING_SENT")
+                            evlog(f"GREETING_SENT seq={greeted_seq}")
                         except Exception as e:
                             evlog(f"GREETING_ERR {e}")
 
@@ -309,7 +318,8 @@ def evlog(msg):
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max", type=int, default=300)
+    ap.add_argument("--max", type=int, default=0,
+                    help="seconds to run; 0 = forever (daemon)")
     args = ap.parse_args()
 
     import websockets
@@ -376,8 +386,7 @@ async def main():
 
         t0 = time.time()
         grabbed = False
-        last_feed = 0.0
-        while time.time() - t0 < args.max:
+        while args.max <= 0 or time.time() - t0 < args.max:
             # 1. try to grab the call once it's connected
             if not grabbed:
                 g = await eval_js(GRAB_JS)
@@ -385,10 +394,22 @@ async def main():
                     grabbed = True
                     print("\n*** ARIA IS ON THE CALL — her track on the sender, "
                           "mic streaming to GPT ***\n")
-                    state["greet_now"] = True   # pump() sends the kickoff
+                    state["greet_seq"] = state.get("greet_seq", 0) + 1
                 elif not g.startswith("no-live-sender") and not g.startswith("ice:") \
                         and not g.startswith("no-inbound"):
                     print(f"[!] grab: {g}")
+            # 1b. daemon: detect call end (inbound track dies) and re-arm
+            #     so the NEXT call from the app gets Aria automatically
+            if grabbed:
+                alive = await eval_js(
+                    "(window.__inbound||[]).some(t => t.readyState === 'live')")
+                if not alive:
+                    grabbed = False
+                    await eval_js("if (window.__aria) window.__aria.attached = false")
+                    state["voice_seen"] = False
+                    state["mic_peak_max"] = 0
+                    evlog("CALL_ENDED re-armed")
+                    print("[*] call ended — re-armed; every new call gets Aria")
             # 2. ship her audio into the call
             if grabbed and q_out.qsize():
                 chunks = []
@@ -438,11 +459,14 @@ async def main():
                 print(f"    mic_peak_max={state.get('mic_peak_max', 0)} "
                       f"(>2000 while talking = voice reaching GPT)")
             if state["gpt_error"] and not state["gpt_ready"]:
-                raise SystemExit(f"[!] gpt error: {state['gpt_error']}")
+                evlog(f"GPT_DIED {state['gpt_error']}")
+                print(f"[!] gpt session died: {state['gpt_error']} — respawning")
+                state["gpt_error"] = None
+                state["gpt_ready"] = False
+                start_gpt(q_in, q_out, state)
             await asyncio.sleep(0.1)
 
-        print("[*] time window elapsed — call it a wrap")
-
+        print("[*] daemon window elapsed" if args.max > 0 else "")
 
 # mic binding events arrive as Runtime.bindingCalled notifications on the
 # same socket; we consume them inside rpc()'s dispatch loop. To keep this
