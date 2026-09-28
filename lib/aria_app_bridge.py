@@ -139,6 +139,9 @@ ARIA_JS = r"""
     } catch (e) { a.state = 'feed-err:' + String(e).slice(0,80); }
   };
   window.__ariaFeed = a.feed;
+  // GV relay never returns caller voice on the inbound track (verified
+  // via receiver audioLevel stats) — the caller talks into the Mac mic.
+  a.useMacMic = true;
 
   // mic capture: NATIVE-RATE ScriptProcessor (8k ctx resamples the track
   // to silence in Chromium — verified: 48k analyser saw the voice, the
@@ -188,6 +191,23 @@ ARIA_JS = r"""
     a.tappedTrack = track;
     return _attach(track);
   };
+  // GV relay never returns caller voice on the inbound track (verified
+  // via receiver audioLevel stats: 0.5 during relay announcements,
+  // 0.001-0.03 while the caller talks). Aria hears the caller through
+  // the Mac's own mic instead.
+  a.micFromMac = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(
+        {audio: {echoCancellation: true, noiseSuppression: true,
+                 autoGainControl: true, channelCount: 1}});
+      const track = stream.getAudioTracks()[0];
+      const r = a.attach(track);
+      return 'mac-mic: ' + r + ' (' + track.label + ')';
+    } catch (e) {
+      a.state = 'macmic-err:' + String(e).slice(0,80);
+      return 'macmic-err:' + String(e).slice(0,80);
+    }
+  };
   return 'installed';
 })()
 """
@@ -203,8 +223,6 @@ GRAB_JS = r"""
   if (!target) return 'no-live-sender';
   const pcState = (window.__pcs[target.pc] || {}).iceConnectionState;
   if (pcState !== 'connected' && pcState !== 'completed') return 'ice:' + pcState;
-  const inb = (window.__inbound || []).find(t => t.kind === 'audio' && t.readyState === 'live');
-  if (!inb) return 'no-inbound';
   // her track into the sender (mutes the app mic) — only when it
   // actually differs; hammering replaceTrack 10x/s (re-grab loop)
   // churns Chromium's send path into static
@@ -212,7 +230,20 @@ GRAB_JS = r"""
   if (target.sender.track !== her) {
     await target.sender.replaceTrack(her);
   }
-  a.attach(inb);
+  if (a.useMacMic) {
+    // caller audio comes from the Mac mic (GV never returns voice on
+  // the inbound track — verified via receiver audioLevel stats). One
+  // exclusive tap; never also taps the inbound track.
+    if (!a.macMicReady) {
+      a.macMicReady = true;
+      const r = await a.micFromMac();
+      window.__pcEvents.push('MACMIC:' + r);
+    }
+  } else {
+    const inb = (window.__inbound || []).find(t => t.kind === 'audio' && t.readyState === 'live');
+    if (!inb) return 'no-inbound';
+    a.attach(inb);
+  }
   return 'live';
 })()
 """
