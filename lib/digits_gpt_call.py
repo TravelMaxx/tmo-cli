@@ -140,107 +140,112 @@ async def run(target, max_seconds):
     stop_event = asyncio.Event()
     counters = {"in_rtp": 0, "silence": 0, "gpt_out_deltas": 0, "gpt_out_bytes": 0}
 
-    print("[gpt] connecting...")
-    connection = await client.live.connect().__aenter__()
+    print("[gpt] connecting (isolated loop)...")
+    # ISOLATED EVENT LOOP for the GPT websocket: the bridge loop carries
+    # Chromium/aiortc/DIGITS load and was starving the websocket handshake
+    # (silent death before session.started). Thread-safe queues bridge them.
+    import threading
+    gpt_in = asyncio.Queue()   # (redefined below as thread-safe wrappers)
+    from queue import SimpleQueue
 
-    EVLOG = config.ROOT / "gpt_events.log"
+    _q_in = SimpleQueue()      # bridge -> gpt (caller audio)
+    _q_out = SimpleQueue()     # gpt -> bridge (her audio)
+    _gpt_state = {"started": False, "error": None, "session_id": None,
+                  "greeted_on_pickup": False}
+
+    def _gpt_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def _run():
+            from openai import AsyncOpenAI as _AOC
+            cli = _AOC(api_key=config.load_env()["OAI_API_KEY"])
+            conn = await cli.live.connect().__aenter__()
+
+            async def recv():
+                await conn.session.start(session=session_cfg,
+                                         event_id=f"ev_{uuid.uuid4().hex[:8]}")
+                async for ev in conn:
+                    et = getattr(ev, "type", None)
+                    if et == "session.started":
+                        _gpt_state["session_id"] = ev.session.id
+                        _gpt_state["started"] = True
+                        evlog(f"SESSION_STARTED {ev.session.id}")
+                        # arm the pickup greeting now (fires when bridge says so)
+                    elif et == "session.output_audio.delta":
+                        _q_out.put(base64.b64decode(ev.delta))
+                    elif et == "session.output_transcript.delta":
+                        evlog(f"SAYS {ev.delta[:60]}")
+                    elif et == "error":
+                        _gpt_state["error"] = str(ev)[:300]
+                        evlog(f"ERROR {str(ev)[:200]}")
+                    elif et == "session.closed":
+                        evlog("CLOSED")
+                        return
+
+            async def send_loop():
+                # forward caller audio; pump silence when idle (docs req)
+                import time as _t
+                while True:
+                    real = None
+                    try:
+                        real = _q_in.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        if real is not None:
+                            await conn.session.input_audio.append(
+                                audio=base64.b64encode(real).decode())
+                        else:
+                            await conn.session.input_audio.append(
+                                audio=base64.b64encode(b"\xff" * 3200).decode())
+                    except Exception:
+                        return
+                    await asyncio.sleep(0.16)
+
+            async def greeter():
+                # wait for pickup signal from the bridge loop
+                while not _gpt_state.get("pickup"):
+                    await asyncio.sleep(0.1)
+                try:
+                    await conn.session.instructions.append(
+                        event_id=f"go_{uuid.uuid4().hex[:6]}",
+                        delegation_id=None,
+                        content=("The caller just picked up — greet them NOW, "
+                                 "warmly: 'Hey! I'm Aria, the personal "
+                                 "assistant. How can I help?' Then pause "
+                                 "and listen."))
+                    _gpt_state["greeted_on_pickup"] = True
+                    evlog("PICKUP_GREETING_SENT")
+                except Exception as e:
+                    evlog(f"PICKUP_GREETING_ERR {e}")
+
+            tasks = [asyncio.create_task(recv()),
+                     asyncio.create_task(send_loop()),
+                     asyncio.create_task(greeter())]
+            await asyncio.gather(*tasks)
+
+        try:
+            loop.run_until_complete(_run())
+        except Exception as e:
+            _gpt_state["error"] = str(e)[:300]
+            evlog(f"THREAD_DIED {e}")
+
+    threading.Thread(target=_gpt_thread, daemon=True).start()
+
+    # wait for session start (up to 15s) without blocking the bridge loop
+    t0 = time.time()
+    while not _gpt_state["started"] and not _gpt_state["error"]:
+        if time.time() - t0 > 15:
+            raise SystemExit("[gpt] session never started (isolated thread)")
+        await asyncio.sleep(0.2)
+    if _gpt_state["error"]:
+        raise SystemExit(f"[gpt] session error: {_gpt_state['error']}")
+    print(f"[gpt] session ready ({_gpt_state['session_id']}) — isolated loop")
 
     def evlog(msg):
         with open(EVLOG, "a") as f:
             f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-
-    async def gpt_recv():
-        try:
-            await connection.session.start(
-                session=session_cfg, event_id=f"ev_{uuid.uuid4().hex[:8]}")
-            async for event in connection:
-                et = getattr(event, "type", None)
-                if et:
-                    evlog(et)
-                if et == "session.started":
-                    print(f"[gpt] session ready ({event.session.id})")
-                    # PROVEN SEQUENCE (standalone 310KB test): instruction
-                    # fires ~1s after session start, while silence streams —
-                    # NOT at call-connect 10-15s later
-                    async def _greet_later():
-                        # user pref: wait >=20s before greeting; keep the
-                        # session engaged with keep-waiting commentary so the
-                        # model doesn't idle out (docs: commentary.append is
-                        # context the model can use; delegation_id=None)
-                        try:
-                            for tick in range(4):  # 5s apart = 20s
-                                await asyncio.sleep(5.0)
-                                if stop_event.is_set():
-                                    return
-                                await connection.session.commentary.append(
-                                    event_id=f"keep_{tick}_{uuid.uuid4().hex[:4]}",
-                                    delegation_id=None,
-                                    content=("The line is quiet right now — the "
-                                             "caller hasn't spoken yet. Keep "
-                                             "waiting patiently and listening. "
-                                             "Do not hang up or end anything."))
-                                evlog(f"KEEP_WAITING_{tick}")
-                            if stop_event.is_set():
-                                return
-                            await connection.session.instructions.append(
-                                event_id=f"gr_{uuid.uuid4().hex[:6]}",
-                                delegation_id=None,
-                                content=("Now greet the caller in English. Say: "
-                                         "'Hey! This is Aria, the personal "
-                                         "assistant calling on behalf of the "
-                                         "account holder. Just confirming the "
-                                         "assistant line works. Talk soon!' "
-                                         "Then pause and listen."))
-                            print("[gpt] opening instruction sent (after 20s + keepalives)")
-                            evlog("INSTRUCTION_SENT")
-                        except Exception as e:
-                            evlog(f"INSTRUCTION_ERR {e}")
-                            print(f"[gpt] instruction failed: {e}")
-                    asyncio.create_task(_greet_later())
-                elif et == "session.output_audio.delta":
-                    d = base64.b64decode(event.delta)
-                    counters["gpt_out_deltas"] += 1
-                    counters["gpt_out_bytes"] += len(d)
-                    if counters["gpt_out_deltas"] == 1:
-                        print("[gpt] FIRST OUTPUT DELTA — she is speaking")
-                        evlog("FIRST_AUDIO_DELTA")
-                    await gpt_out.put(d)
-                elif et == "session.output_transcript.delta":
-                    print(f"[gpt] says: {event.delta}", end="", flush=True)
-                elif et == "error":
-                    try:
-                        print(f"\n[gpt] ERROR: {event.model_dump_json()[:400]}")
-                    except Exception:
-                        print(f"\n[gpt] ERROR: {event}")
-                elif et == "session.closed":
-                    print(f"\n[gpt] closed (usage={getattr(event, 'usage', '')})")
-                    stop_event.set()
-        except Exception as e:
-            if not stop_event.is_set():
-                print(f"[gpt] recv loop ended: {e}")
-
-    async def gpt_silence_and_audio():
-        """DOCS: input audio must run from session start (even silence).
-        Real caller audio (from gpt_in) is forwarded when present."""
-        while not stop_event.is_set():
-            try:
-                real = None
-                try:
-                    real = gpt_in.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                if real is not None:
-                    await connection.session.input_audio.append(
-                        audio=base64.b64encode(real).decode("ascii"))
-                else:
-                    await connection.session.input_audio.append(
-                        audio=base64.b64encode(b"\xff" * 160 * 20).decode("ascii"))
-                    counters["silence"] += 1
-                await asyncio.sleep(0.16)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                return
 
     # ---------------- the call: EXACTLY the proven plain-call flow ---------
     pc = RTCPeerConnection(configuration=RTCConfiguration(
@@ -347,9 +352,7 @@ async def run(target, max_seconds):
             stop_event.set()
             state["ended"] = True
 
-    tasks = [asyncio.create_task(gpt_recv()),
-             asyncio.create_task(gpt_silence_and_audio()),
-             asyncio.create_task(rtp_to_gpt()),
+    tasks = [asyncio.create_task(rtp_to_gpt()),
              asyncio.create_task(gpt_to_rtp()),
              asyncio.create_task(watchdog())]
 
@@ -411,14 +414,7 @@ async def run(target, max_seconds):
             await pc.close()
         except Exception:
             pass
-        try:
-            await connection.session.close()
-        except Exception:
-            pass
-        try:
-            await connection.close()
-        except Exception:
-            pass
+        # GPT session lives on its own daemon thread — dies with process
 
     print(f"\n6. result: connected={state['connected']} "
           f"in_rtp={counters['in_rtp']} gpt_out={counters['gpt_out_bytes']}B "
