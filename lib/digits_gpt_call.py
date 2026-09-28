@@ -18,6 +18,8 @@ Usage: tmo ai-call --target 5551234567 [--max 240]
 """
 
 import argparse
+
+import numpy as np
 import asyncio
 import base64
 import json
@@ -66,13 +68,21 @@ def make_gpt_track():
                 ulaw = await asyncio.wait_for(self.queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 ulaw = b"\xff" * 160  # PCMU silence
-            pcm = call_stack.ulaw_to_pcm(ulaw[:160])
-            if len(pcm) < 320:
-                pcm += b"\x00" * (320 - len(pcm))
+            # drain whatever else is queued (send whole bursts, keeps pacing)
+            burst = bytearray(ulaw)
+            while len(burst) < 1600:
+                try:
+                    burst.extend(self.queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            pcm = call_stack.ulaw_to_pcm(bytes(burst))
             samples = len(pcm) // 2
-            frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
+            frame = av.AudioFrame.from_ndarray(
+                np.frombuffer(pcm, dtype="<i2").reshape(1, -1),
+                format="s16", layout="mono")
             frame.sample_rate = 8000
-            frame.planes[0].update(pcm)
+            # pts in 1/8000 timebase (matches sample_rate) — the encoder
+            # rescales; a mismatched timebase starves it (silent call bug)
             frame.pts = self.pts
             self.pts += samples
             return frame
@@ -126,20 +136,67 @@ async def run(target, max_seconds):
     print("[gpt] connecting...")
     connection = await client.live.connect().__aenter__()
 
+    EVLOG = config.ROOT / "gpt_events.log"
+
+    def evlog(msg):
+        with open(EVLOG, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+
     async def gpt_recv():
         try:
             await connection.session.start(
                 session=session_cfg, event_id=f"ev_{uuid.uuid4().hex[:8]}")
             async for event in connection:
                 et = getattr(event, "type", None)
+                if et:
+                    evlog(et)
                 if et == "session.started":
                     print(f"[gpt] session ready ({event.session.id})")
+                    # PROVEN SEQUENCE (standalone 310KB test): instruction
+                    # fires ~1s after session start, while silence streams —
+                    # NOT at call-connect 10-15s later
+                    async def _greet_later():
+                        # user pref: wait >=20s before greeting; keep the
+                        # session engaged with keep-waiting commentary so the
+                        # model doesn't idle out (docs: commentary.append is
+                        # context the model can use; delegation_id=None)
+                        try:
+                            for tick in range(4):  # 5s apart = 20s
+                                await asyncio.sleep(5.0)
+                                if stop_event.is_set():
+                                    return
+                                await connection.session.commentary.append(
+                                    event_id=f"keep_{tick}_{uuid.uuid4().hex[:4]}",
+                                    delegation_id=None,
+                                    content=("The line is quiet right now — the "
+                                             "caller hasn't spoken yet. Keep "
+                                             "waiting patiently and listening. "
+                                             "Do not hang up or end anything."))
+                                evlog(f"KEEP_WAITING_{tick}")
+                            if stop_event.is_set():
+                                return
+                            await connection.session.instructions.append(
+                                event_id=f"gr_{uuid.uuid4().hex[:6]}",
+                                delegation_id=None,
+                                content=("Now greet the caller in English. Say: "
+                                         "'Hey! This is Aria, the personal "
+                                         "assistant calling on behalf of the "
+                                         "account holder. Just confirming the "
+                                         "assistant line works. Talk soon!' "
+                                         "Then pause and listen."))
+                            print("[gpt] opening instruction sent (after 20s + keepalives)")
+                            evlog("INSTRUCTION_SENT")
+                        except Exception as e:
+                            evlog(f"INSTRUCTION_ERR {e}")
+                            print(f"[gpt] instruction failed: {e}")
+                    asyncio.create_task(_greet_later())
                 elif et == "session.output_audio.delta":
                     d = base64.b64decode(event.delta)
                     counters["gpt_out_deltas"] += 1
                     counters["gpt_out_bytes"] += len(d)
                     if counters["gpt_out_deltas"] == 1:
                         print("[gpt] FIRST OUTPUT DELTA — she is speaking")
+                        evlog("FIRST_AUDIO_DELTA")
                     await gpt_out.put(d)
                 elif et == "session.output_transcript.delta":
                     print(f"[gpt] says: {event.delta}", end="", flush=True)
@@ -268,10 +325,20 @@ async def run(target, max_seconds):
                 pass
 
     async def watchdog():
-        await asyncio.sleep(max_seconds)
-        print(f"\n[bridge] {max_seconds}s limit")
-        stop_event.set()
-        state["ended"] = True
+        # voicemail mode: end the call 30s after connect so the message
+        # lands; otherwise the absolute max
+        while not stop_event.is_set() and not state["ended"]:
+            if state.get("vm_at") and time.time() - state["vm_at"] > 30:
+                print("   [vm] 30s message window done — hanging up")
+                stop_event.set()
+                state["ended"] = True
+                return
+            await asyncio.sleep(1)
+        await asyncio.sleep(max(0, max_seconds - (time.time() - t0)))
+        if not stop_event.is_set():
+            print(f"\n[bridge] {max_seconds}s limit")
+            stop_event.set()
+            state["ended"] = True
 
     tasks = [asyncio.create_task(gpt_recv()),
              asyncio.create_task(gpt_silence_and_audio()),
@@ -316,6 +383,8 @@ async def run(target, max_seconds):
                             RTCSessionDescription(sdp=fixed, type="answer"))
                         state["connected"] = True
                         print("   *** CALL CONNECTED (answer applied) — AI ON THE LINE ***")
+                        # opening instruction already sent at session start
+                        state["vm_at"] = time.time()
                     except Exception as e:
                         print(f"   [!] answer application failed: {e}")
                         state["ended"] = True
