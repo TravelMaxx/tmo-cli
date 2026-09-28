@@ -62,29 +62,36 @@ def make_gpt_track():
             super().__init__()
             self.queue = asyncio.Queue()
             self.pts = 0
+            self._in_pts = 0
+            # 8k -> 48k so frames EXACTLY match the negotiated opus codec
+            # (opus is 48kHz-only; 8k frames + mismatched timebase starve
+            # the encoder — the silent-call bug)
+            self._up = av.AudioResampler(format="s16", layout="mono", rate=48000)
 
         async def recv(self):
             try:
                 ulaw = await asyncio.wait_for(self.queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 ulaw = b"\xff" * 160  # PCMU silence
-            # drain whatever else is queued (send whole bursts, keeps pacing)
             burst = bytearray(ulaw)
-            while len(burst) < 1600:
+            while len(burst) < 1600:  # drain queue — send bursts, keep pacing
                 try:
                     burst.extend(self.queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
             pcm = call_stack.ulaw_to_pcm(bytes(burst))
-            samples = len(pcm) // 2
-            frame = av.AudioFrame.from_ndarray(
+            in_samples = len(pcm) // 2
+            in_frame = av.AudioFrame.from_ndarray(
                 np.frombuffer(pcm, dtype="<i2").reshape(1, -1),
                 format="s16", layout="mono")
-            frame.sample_rate = 8000
-            # pts in 1/8000 timebase (matches sample_rate) — the encoder
-            # rescales; a mismatched timebase starves it (silent call bug)
-            frame.pts = self.pts
-            self.pts += samples
+            in_frame.sample_rate = 8000
+            in_frame.pts = self._in_pts
+            self._in_pts += in_samples
+            # exact 6x multiple: 20ms in -> 20ms out, no buffered delay
+            out = self._up.resample(in_frame)
+            frame = out[0] if isinstance(out, list) else out
+            frame.pts = self.pts            # pts in the 48k timebase
+            self.pts += frame.samples
             return frame
 
     return _Track()
