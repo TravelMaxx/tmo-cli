@@ -149,6 +149,7 @@ ARIA_JS = r"""
       // 7350 Hz mislabeled as 8k = ~9% pitch/speed garble (GPT heard
       // speech-shaped noise: 'I think I missed that'). 48k/6 = exactly 8k.
       const ctx = new AudioContext({sampleRate: 48000});
+      a.capCtx = ctx;
       const ratio = 6;
       const src = ctx.createMediaStreamSource(new MediaStream([track]));
       const proc = ctx.createScriptProcessor(4096, 1, 1);
@@ -176,11 +177,15 @@ ARIA_JS = r"""
       return 'attached';
     } catch (e) { a.state = 'attach-err:' + String(e).slice(0,80); return null; }
   };
-  // GRAB may run repeatedly (bridge restarts); one mic tap per call
+  // attach guard keyed on TRACK LIVENESS, not a boolean: GV's bridge
+  // replaces the inbound track mid-call (screening-leg track dies when
+  // the real leg connects); re-tap the new track automatically.
   const _attach = a.attach;
   a.attach = (track) => {
-    if (a.attached) return 'already';
-    a.attached = true;
+    if (a.tappedTrack && a.tappedTrack === track &&
+        a.tappedTrack.readyState === 'live') return 'already';
+    try { if (a.capCtx) a.capCtx.close(); } catch (e) {}
+    a.tappedTrack = track;
     return _attach(track);
   };
   return 'installed';
@@ -200,8 +205,13 @@ GRAB_JS = r"""
   if (pcState !== 'connected' && pcState !== 'completed') return 'ice:' + pcState;
   const inb = (window.__inbound || []).find(t => t.kind === 'audio' && t.readyState === 'live');
   if (!inb) return 'no-inbound';
-  // her track into the sender (mutes the app mic)
-  await target.sender.replaceTrack(a.herDest.stream.getAudioTracks()[0]);
+  // her track into the sender (mutes the app mic) — only when it
+  // actually differs; hammering replaceTrack 10x/s (re-grab loop)
+  // churns Chromium's send path into static
+  const her = a.herDest.stream.getAudioTracks()[0];
+  if (target.sender.track !== her) {
+    await target.sender.replaceTrack(her);
+  }
   a.attach(inb);
   return 'live';
 })()
@@ -222,11 +232,13 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
     def thread_main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        evlog("THREAD_START")
 
         async def run():
+            evlog("RUN_ENTER")
             cli = AsyncOpenAI(api_key=load_api_key())
             conn = await cli.live.connect().__aenter__()
-
+            evlog("WS_CONNECTED")
             async def recv():
                 evlog("GPT_CONNECTING")
                 await conn.session.start(
@@ -257,6 +269,17 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                 # saw an end-of-turn, so she never spoke. Mic chunks drain
                 # continuously; silence fills only the gaps.
                 import base64 as b64mod
+                # CRITICAL: never append before session.start — OpenAI
+                # kills the whole connection ('The first Live event must
+                # be session.start'). Wait for recv() to finish starting.
+                t_wait = 0.0
+                while not state.get("gpt_ready"):
+                    await asyncio.sleep(0.05)
+                    t_wait += 0.05
+                    if t_wait > 20:
+                        evlog("PUMP_GAVE_UP_WAITING")
+                        return
+                evlog("PUMP_ARMED")
                 sent = 0
                 t_start = asyncio.get_event_loop().time()
                 greeted_seq = 0
@@ -377,8 +400,6 @@ async def main():
         print("[*] waiting for a live call (place it from the app now)...")
         print("[*] starting GPT session in background thread...")
         start_gpt(q_in, q_out, state)
-
-        # mic transport: page-side ring buffer pulled each loop iteration.
         # (Bindings proved unreliable across bridge restarts — a dead
         # session can own the name and the audio goes nowhere.)
         def pull_mic():
@@ -387,29 +408,26 @@ async def main():
         t0 = time.time()
         grabbed = False
         while args.max <= 0 or time.time() - t0 < args.max:
-            # 1. try to grab the call once it's connected
-            if not grabbed:
-                g = await eval_js(GRAB_JS)
-                if g == "live":
-                    grabbed = True
-                    print("\n*** ARIA IS ON THE CALL — her track on the sender, "
-                          "mic streaming to GPT ***\n")
-                    state["greet_seq"] = state.get("greet_seq", 0) + 1
-                elif not g.startswith("no-live-sender") and not g.startswith("ice:") \
-                        and not g.startswith("no-inbound"):
-                    print(f"[!] grab: {g}")
-            # 1b. daemon: detect call end (inbound track dies) and re-arm
-            #     so the NEXT call from the app gets Aria automatically
-            if grabbed:
-                alive = await eval_js(
-                    "(window.__inbound||[]).some(t => t.readyState === 'live')")
-                if not alive:
-                    grabbed = False
-                    await eval_js("if (window.__aria) window.__aria.attached = false")
-                    state["voice_seen"] = False
-                    state["mic_peak_max"] = 0
-                    evlog("CALL_ENDED re-armed")
-                    print("[*] call ended — re-armed; every new call gets Aria")
+            # 1. grab AND RE-GRAB every iteration: GV's bridge swaps the
+            #    inbound track mid-call (screening leg dies at pickup);
+            #    the payload's track-liveness guard re-taps the fresh
+            #    track, and replaceTrack on the same track is a no-op
+            g = await eval_js(GRAB_JS)
+            if not grabbed and g == "live":
+                grabbed = True
+                print("\n*** ARIA IS ON THE CALL — her track on the sender, "
+                      "mic streaming to GPT ***\n")
+                state["greet_seq"] = state.get("greet_seq", 0) + 1
+            elif grabbed and g == "no-inbound":
+                # all inbound tracks dead = call over; re-arm for next call
+                grabbed = False
+                state["voice_seen"] = False
+                state["mic_peak_max"] = 0
+                evlog("CALL_ENDED re-armed")
+                print("[*] call ended — re-armed; every new call gets Aria")
+            elif g not in ("live", "no-live-sender", "no-inbound") \
+                    and not g.startswith("ice:"):
+                print(f"[!] grab: {g}")
             # 2. ship her audio into the call
             if grabbed and q_out.qsize():
                 chunks = []
@@ -455,9 +473,11 @@ async def main():
                 pass
 
             if int(time.time() - t0) % 15 == 0:
+                import threading as _th
                 st = await eval_js(STATE_JS)
                 print(f"    mic_peak_max={state.get('mic_peak_max', 0)} "
-                      f"(>2000 while talking = voice reaching GPT)")
+                      f"threads={_th.active_count()} gpt_ready={state.get('gpt_ready')} "
+                      f"gpt_err={state.get('gpt_error')}")
             if state["gpt_error"] and not state["gpt_ready"]:
                 evlog(f"GPT_DIED {state['gpt_error']}")
                 print(f"[!] gpt session died: {state['gpt_error']} — respawning")
