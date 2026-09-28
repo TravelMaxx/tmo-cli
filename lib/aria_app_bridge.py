@@ -112,10 +112,23 @@ ARIA_JS = r"""
   // mic shim: ring buffer Python pulls via Runtime.evaluate (CDP bindings
   // proved unreliable across bridge restarts)
   window.__micBuf = window.__micBuf || [];
+  // EXCLUSIVE by construction: whatever stale capture handlers from older
+  // payload installs are still running, they ALL call window.__ariaMic.
+  // Only audio from the CURRENT payload's capture context is kept —
+  // every push is tagged with the owner id; others are dropped. This
+  // kills the 2x-rate double-feed even when old closures survive.
+  window.__ariaMicOwner = null;
   window.__ariaMic = (b64) => {
+    if (window.__ariaMicOwner !== null &&
+        window.__ariaMicTag !== window.__ariaMicOwner) return;   // stale tap: drop
     window.__micBuf.push(b64);
     if (window.__micBuf.length > 300) window.__micBuf.splice(0, 150);
   };
+  // KILL all capture contexts from any PREVIOUS payload install — else
+  // old + new both push into __micBuf and GPT input runs at 2x real-time
+  window.__allCapCtxs = window.__allCapCtxs || [];
+  for (const c of window.__allCapCtxs) { try { c.close(); } catch (e) {} }
+  window.__allCapCtxs = [];
   const a = window.__aria;
 
   // 48k context: her voice -> MediaStreamTrack
@@ -153,6 +166,8 @@ ARIA_JS = r"""
       // speech-shaped noise: 'I think I missed that'). 48k/6 = exactly 8k.
       const ctx = new AudioContext({sampleRate: 48000});
       a.capCtx = ctx;
+      // tag: this capture's pushes own the mic buffer
+      window.__ariaMicOwner = 'aria-' + Date.now();
       const ratio = 6;
       const src = ctx.createMediaStreamSource(new MediaStream([track]));
       const proc = ctx.createScriptProcessor(4096, 1, 1);
@@ -189,6 +204,8 @@ ARIA_JS = r"""
         a.tappedTrack.readyState === 'live') return 'already';
     try { if (a.capCtx) a.capCtx.close(); } catch (e) {}
     a.tappedTrack = track;
+    // claim the mic buffer for THIS payload; drops every older handler
+    window.__ariaMicTag = window.__ariaMicOwner;
     return _attach(track);
   };
   // GV relay never returns caller voice on the inbound track (verified
@@ -290,6 +307,8 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                         q_out.put(base64.b64decode(ev.delta))
                     elif et == "session.output_transcript.delta":
                         evlog(f"SAYS {ev.delta[:100]}")
+                    elif et == "session.input_transcript.delta":
+                        evlog(f"HEARD {ev.delta[:100]}")
                     elif et == "error":
                         state["gpt_error"] = str(ev)[:200]
                         evlog(f"ERROR {str(ev)[:150]}")
@@ -456,6 +475,14 @@ async def main():
                 state["mic_peak_max"] = 0
                 evlog("CALL_ENDED re-armed")
                 print("[*] call ended — re-armed; every new call gets Aria")
+            elif g == "aria-missing":
+                # page navigated (e.g. call window re-route) and wiped our
+                # injected state — re-arm on the SAME page, immediately
+                print("[*] payload wiped by navigation — re-injecting")
+                await eval_js(HOOK_JS)
+                a = await eval_js(ARIA_JS)
+                evlog(f"REINJECTED {a}")
+                state["reinjects"] = state.get("reinjects", 0) + 1
             elif g not in ("live", "no-live-sender", "no-inbound") \
                     and not g.startswith("ice:"):
                 print(f"[!] grab: {g}")
