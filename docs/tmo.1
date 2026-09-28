@@ -1,0 +1,87 @@
+.\" tmo(1) manual page
+.TH TMO 1 "September 2026" "tmo-cli 1.0" "User Commands"
+.SH NAME
+tmo \- headless CLI client for DIGITS from T-Mobile
+.SH SYNOPSIS
+.B tmo
+\fICOMMAND\fR [\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B tmo
+authenticates to DIGITS (T-Mobile's line-sharing service) via the real
+browser OAuth flow, then operates the line over the DaaS REST API and the
+WRG WebSocket notification protocol: sending texts, reading call history,
+checking voicemail, placing voice calls, running an AI text auto-responder,
+and bridging calls to an OpenAI GPT-Live voice agent.
+.PP
+Authentication is browser-login-only: credentials are obtained exclusively
+through \fBtmo login\fR (browser + 2FA + localhost:8080 callback). There is
+no REST token refresh by design — the scripted path trips bot detection.
+Access tokens live ~24h.
+.SH COMMANDS
+.TP
+.B login [\-\-username N]
+Browser OAuth login (password + SMS 2FA). Saves tokens to
+.IR tokens.json .
+With \-\-username (10 digits), non-interactive credential entry.
+.TP
+.B register
+Establish the DaaS session and register this device on the line
+(\fImanageSession\fR then \fIregister\fR — the app's order).
+.TP
+.B status
+Show device identity, line, and token state.
+.TP
+.B sms send \-\-to N \-\-text T
+Send a text from the line to a 10-digit number. Rides the RCS/IMS chat
+stack when the recipient is capable (delivery + read receipts).
+.TP
+.B threads
+List conversation threads (device-scoped: a fresh device sees only
+messages from its connection onward).
+.TP
+.B calllogs
+Line-scoped call history: numbers, direction, duration, timestamps.
+.TP
+.B e911
+E911 address on file for the line.
+.TP
+.B listen
+Live monitor: connect the notification channel and print every incoming
+text/call/registration event as it happens.
+.TP
+.B respond
+AI auto-responder: texts arriving from the allowlisted number
+(\fBTMO_RESPOND_TO\fR in .env) are answered by OpenAI gpt-5.4-mini using
+the mission prompt in \fIlib/respond_persona.txt\fR. All other senders
+are logged and ignored. Requires \fBOAI_API_KEY\fR.
+.TP
+.B call \-\-target N [\-\-hold S]
+Place a voice call (WebRTC, PCMU/opus). Requires the \fBvoice\fR extra.
+.TP
+.B ai-call \-\-target N [\-\-max S]
+AI voice agent holds the call via OpenAI GPT-Live. Requires \fBvoice\fR
+and \fBai\fR extras and \fBOAI_API_KEY\fR.
+.SH FILES
+.TP
+.I .env
+Credentials: TMOBILE_USERNAME, TMOBILE_PASSWORD, OAI_API_KEY,
+TMO_RESPOND_TO. Never committed.
+.TP
+.I tokens.json
+DaaS tokens from the last \fBtmo login\fR.
+.TP
+.I device.json
+This install's device identity (UUID + session number).
+.SH SECURITY
+The DIGITS API accepts a single \fIdaasAccessToken\fR header with no
+client attestation, and the desktop app stores it unencrypted. Any
+process on the machine can operate the line. This tool demonstrates that
+exposure — use only on your own account. Rapid automated call attempts
+can trigger carrier fraud throttling (403 CC_TRANS_O_FRAUDULENT_MOBILE);
+if calls suddenly fail, stop for 24–48h.
+.SH INSTALL
+.B pip install git+https://github.com/TravelMaxx/tmo-cli.git
+.br
+.B curl \-fsSL https://raw.githubusercontent.com/TravelMaxx/tmo-cli/main/quick-install.sh | bash
+.SH SEE ALSO
+Full documentation: \fIhttps://github.com/TravelMaxx/tmo-cli\fR

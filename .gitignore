@@ -1,0 +1,25 @@
+# secrets & session material — never commit
+.env
+tokens*.json
+authcode.json
+device.json
+channel_url.txt
+
+# runtime artifacts
+*.log
+*.png
+evidence*/
+audit_evidence/
+venv/
+.DS_Store
+
+# packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# pycache/backups never committed
+__pycache__/
+*.pyc
+*.bak
+responder.out

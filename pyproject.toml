@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tmo-digits-cli"
+version = "1.0.0"
+description = "Headless CLI for DIGITS from T-Mobile: login, SMS, call history, voice calls, and AI voice agent"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "TravelMaxx" }]
+keywords = ["t-mobile", "digits", "telephony", "sms", "webrtc", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Telephony",
+]
+# core deps only — everything works except voice/ai-call without the extras
+dependencies = [
+    "requests>=2.31",
+    "websocket-client>=1.7",
+    "websockets>=12",
+    "python-dotenv>=1.0",
+    "playwright>=1.40",
+]
+
+[project.optional-dependencies]
+voice = ["aiortc>=1.9"]
+ai = ["openai>=1.50"]
+all = ["aiortc>=1.9", "openai>=1.50"]
+
+[project.scripts]
+tmo = "tmo_entry:main"
+
+[project.urls]
+Homepage = "https://github.com/TravelMaxx/tmo-cli"
+
+[tool.setuptools]
+py-modules = ["tmo_entry"]
+packages = ["lib"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+lib = ["persona.txt"]

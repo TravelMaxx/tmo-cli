@@ -1,0 +1,7 @@
+requests>=2.31
+websocket-client>=1.7
+websockets>=12
+python-dotenv>=1.0
+playwright>=1.40
+aiortc>=1.9
+openai>=1.50
