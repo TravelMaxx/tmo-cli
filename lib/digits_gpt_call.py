@@ -112,14 +112,14 @@ async def run(target, max_seconds):
     persona = persona.replace("{OWNER}", owner)
 
     # ---------------- DIGITS session + channel + register (proven order) ----
-    cu, st = call_stack.manage_session(at)
+    cu, st = await call_stack.a_manage_session(at)
     print(f"1. manageSession -> {st}")
     if not cu:
         raise SystemExit("[!] no channelUrl")
     ch = call_stack.ChromeChannel(log_file=str(config.ROOT / "call_ws.log"))
     if not ch.start(cu):
         raise SystemExit("[!] WS channel failed")
-    ok, msg = call_stack.register_line(at)
+    ok, msg = await call_stack.a_register_line(at)
     print(f"2. register -> {msg}")
     if not ok:
         ch.stop()
@@ -259,7 +259,7 @@ async def run(target, max_seconds):
     wire_sdp = call_stack.chrome_wire_offer(pc.localDescription.sdp)
     print(f"3. offer ready (wire {len(wire_sdp)}B, ICE {pc.iceGatheringState})")
 
-    display = call_stack.fetch_display_name(at)
+    display = await asyncio.to_thread(call_stack.fetch_display_name, at)
     print(f"   originatorName: {display!r}")
     body = {"vvoipSessionInformation": {
         "originatorAddress": f"sip:1{msisdn}",
@@ -272,9 +272,10 @@ async def run(target, max_seconds):
     r = None
     for attempt in range(5):
         body["vvoipSessionInformation"]["clientCorrelator"] = str(uuid.uuid4())
-        r = requests.post(f"{config.CALL}/start",
-                          headers=config.headers(at, {"Content-type": "application/json"}),
-                          data=json.dumps(body), timeout=30)
+        r = await asyncio.to_thread(
+            requests.post, f"{config.CALL}/start",
+            headers=config.headers(at, {"Content-type": "application/json"}),
+            data=json.dumps(body), timeout=30)
         print(f"4. call/start try {attempt+1} -> {r.status_code}")
         if r.status_code in (222, 500):
             await asyncio.sleep(5)

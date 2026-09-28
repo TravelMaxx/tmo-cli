@@ -9,6 +9,7 @@ desktop bundle):
   - notifications live inside nsMsg.content.*
 """
 
+import asyncio
 import json
 import re
 import os
@@ -559,3 +560,21 @@ def aiortc_answer(their_sdp: str, our_aiortc_sdp: str) -> str:
         else:
             out.append(l)
     return "\r\n".join(out) + "\r\n"
+
+
+# ------------------------------------------------ async REST wrappers --------
+# The synchronous requests.* calls above each BLOCK the event loop for
+# 0.5-3s (TLS + SSE). While blocked, aioice's STUN retry timers miss
+# their windows and ICE never completes on live calls (the silent-call
+# ICE stall). These wrappers run them in worker threads instead.
+
+async def a_manage_session(access_token, tries=4):
+    return await asyncio.to_thread(manage_session, access_token, tries)
+
+
+async def a_register_line(access_token):
+    return await asyncio.to_thread(register_line, access_token)
+
+
+async def a_sse_poll(status_url, access_token, timeout=30):
+    return await asyncio.to_thread(sse_poll, status_url, access_token, timeout)
