@@ -146,7 +146,11 @@ ARIA_JS = r"""
       const src = a.ctx48.createBufferSource();
       src.buffer = buf; src.connect(a.herDest);
       const now = a.ctx48.currentTime;
-      if (a.nextTime < now + 0.05) a.nextTime = now + 0.05;
+      // BOTH-WAYS clamp: nextTime must sit in [now+0.05, now+2]. It ran
+      // 355s ahead once (accumulated across payload generations while
+      // each new AudioContext restarted its clock at 0) — she spoke into
+      // a 6-minute-delay queue and the caller heard nothing.
+      if (a.nextTime < now + 0.05 || a.nextTime > now + 2) a.nextTime = now + 0.05;
       src.start(a.nextTime); a.nextTime += buf.duration;
       a.her += n;
     } catch (e) { a.state = 'feed-err:' + String(e).slice(0,80); }

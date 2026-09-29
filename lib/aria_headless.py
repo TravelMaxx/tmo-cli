@@ -94,7 +94,9 @@ window.__makeCall = async () => {
       const src = ctx48.createBufferSource();
       src.buffer = buf; src.connect(herDest);
       const now = ctx48.currentTime;
-      if (window.__nextTime < now + 0.05) window.__nextTime = now + 0.05;
+      // BOTH-WAYS clamp (see aria_app_bridge: runaway ahead-scheduling bug)
+      if (window.__nextTime < now + 0.05 || window.__nextTime > now + 2)
+        window.__nextTime = now + 0.05;
       src.start(window.__nextTime);
       window.__nextTime += buf.duration;
       window.__callState.her += n;
@@ -395,6 +397,12 @@ async def main():
             rc = status.get("responseCode")
             print(f"5. NOTIFICATION status={st!r} rc={rc} "
                   f"sdp={'yes' if status.get('sdp') else 'no'}")
+            if status.get("sdp") and st == "InProgress" and str(rc) == "183":
+                # early-media answer SDP (ringback leg) — the app applies
+                # this one (fixIPAddresses/doStandardSdpPrep flow); the
+                # later Connected/rc=200 notification carries no SDP
+                answer_sdp = status["sdp"]
+                print("   using rc=183 early-media SDP as the answer")
             if st == "Connected" and rc == 200 and status.get("sdp"):
                 answer_sdp = status["sdp"]
             elif st in ("ANSWERED", "Connected") and not status.get("sdp"):
