@@ -234,32 +234,36 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
 
             async def pump():
                 import base64 as b64mod
+                # never append before session.started (OpenAI drops the
+                # connection otherwise)
                 while not state.get("gpt_ready"):
                     await asyncio.sleep(0.05)
                 evlog("HL_PUMP_ARMED")
-                sent = 0
-                t_start = asyncio.get_event_loop().time()
+                # bare forwarder, batched to 1600B — the proven shape:
+                # silence-fill interleaving diluted speech 5:1 and GPT's
+                # VAD saw strobe-garbage; 680B tap chunks never worked on
+                # the live path while 1600B replay chunks did.
+                acc = bytearray()
                 while True:
-                    budget = int((asyncio.get_event_loop().time() - t_start)
-                                  * 8000)
-                    room = budget - sent
-                    if room <= 0:
-                        await asyncio.sleep(0.02)
-                        continue
-                    chunk = None
                     try:
-                        chunk = q_in.get_nowait()
+                        chunk = q_in.get(timeout=0.5)
+                        acc.extend(chunk)
                     except Exception:
                         pass
-                    if chunk is None:
-                        chunk = b"\xff" * min(800, room)
-                    payload = chunk[:room]
+                    if len(acc) >= 1600:
+                        payload = bytes(acc[:1600])
+                        del acc[:1600]
+                    elif acc and state.get("flush"):
+                        payload = bytes(acc)
+                        acc.clear()
+                    else:
+                        continue
                     try:
                         await conn.session.input_audio.append(
                             audio=b64mod.b64encode(payload).decode())
-                    except Exception:
-                        return
-                    sent += len(payload)
+                    except Exception as e:
+                        evlog(f"HL_PUMP_ERR {str(e)[:120]}")
+                        await asyncio.sleep(0.5)
 
             await asyncio.gather(recv(), pump())
 
@@ -471,12 +475,19 @@ async def main():
             blob = b"".join(chunks)
             await page.evaluate(
                 f"window.__ariaFeed('{base64.b64encode(blob).decode()}')")
-        # caller audio -> GPT
+        # caller audio -> GPT (batched 1600B — the proven chunk size)
         rj = await page.evaluate(
             "JSON.stringify((window.__micBuf||[]).splice(0, 60))")
         try:
+            acc = bytearray()
             for b64 in json.loads(rj):
-                q_in.put(base64.b64decode(b64))
+                acc.extend(base64.b64decode(b64))
+            while len(acc) >= 1600:
+                q_in.put(bytes(acc[:1600]))
+                del acc[:1600]
+            if acc:
+                q_in.put(bytes(acc))
+                acc.clear()
         except Exception:
             pass
         # call status notes (Terminated = hang up)
