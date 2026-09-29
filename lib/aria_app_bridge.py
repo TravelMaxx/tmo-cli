@@ -163,7 +163,7 @@ ARIA_JS = r"""
   // mic capture: NATIVE-RATE ScriptProcessor (8k ctx resamples the track
   // to silence in Chromium — verified: 48k analyser saw the voice, the
   // 8k SP saw zeros), then decimate 6:1 to 8k for ulaw/PCMU.
-  a.attach = (track) => {
+  a.attach = (track, micGain) => {
     try {
       // FORCE 48k: default ctx is 44.1k on this machine -> /6 gives
       // 7350 Hz mislabeled as 8k = ~9% pitch/speed garble (GPT heard
@@ -174,9 +174,11 @@ ARIA_JS = r"""
       window.__ariaMicOwner = 'aria-' + Date.now();
       const ratio = 6;
       const src = ctx.createMediaStreamSource(new MediaStream([track]));
+      const boost = ctx.createGain();
+      boost.gain.value = micGain || 1.0;   // quiet built-in mic compensation
       const proc = ctx.createScriptProcessor(4096, 1, 1);
       const sink = ctx.createGain(); sink.gain.value = 0;
-      src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
+      src.connect(boost); boost.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
       proc.onaudioprocess = (e) => {
         const f = e.inputBuffer.getChannelData(0);
         const n = Math.floor(f.length / ratio);
@@ -203,7 +205,7 @@ ARIA_JS = r"""
   // replaces the inbound track mid-call (screening-leg track dies when
   // the real leg connects); re-tap the new track automatically.
   const _attach = a.attach;
-  a.attach = (track) => {
+  a.attach = (track, micGain) => {
     if (a.tappedTrack && a.tappedTrack === track &&
         a.tappedTrack.readyState === 'live') return 'already';
     try { if (a.capCtx) a.capCtx.close(); } catch (e) {}
@@ -222,7 +224,7 @@ ARIA_JS = r"""
         {audio: {echoCancellation: true, noiseSuppression: true,
                  autoGainControl: true, channelCount: 1}});
       const track = stream.getAudioTracks()[0];
-      const r = a.attach(track);
+      const r = a.attach(track, 6.0);
       return 'mac-mic: ' + r + ' (' + track.label + ')';
     } catch (e) {
       a.state = 'macmic-err:' + String(e).slice(0,80);
