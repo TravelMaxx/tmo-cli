@@ -170,8 +170,6 @@ ARIA_JS = r"""
       // speech-shaped noise: 'I think I missed that'). 48k/6 = exactly 8k.
       const ctx = new AudioContext({sampleRate: 48000});
       a.capCtx = ctx;
-      // tag: this capture's pushes own the mic buffer
-      window.__ariaMicOwner = 'aria-' + Date.now();
       const ratio = 6;
       const src = ctx.createMediaStreamSource(new MediaStream([track]));
       const boost = ctx.createGain();
@@ -210,8 +208,13 @@ ARIA_JS = r"""
         a.tappedTrack.readyState === 'live') return 'already';
     try { if (a.capCtx) a.capCtx.close(); } catch (e) {}
     a.tappedTrack = track;
-    // claim the mic buffer for THIS payload; drops every older handler
-    window.__ariaMicTag = window.__ariaMicOwner;
+    // claim the mic buffer for THIS payload; drops every older handler.
+    // Single timestamp for BOTH tag and owner — the previous code set
+    // them at different instants (77ms apart), so the exclusive filter
+    // rejected our OWN pushes and GPT got silence-pump only.
+    const claim = 'aria-' + Date.now();
+    window.__ariaMicTag = claim;
+    window.__ariaMicOwner = claim;
     return _attach(track);
   };
   // GV relay never returns caller voice on the inbound track (verified
