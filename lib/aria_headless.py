@@ -32,6 +32,7 @@ from pathlib import Path
 from queue import SimpleQueue
 
 sys.path.insert(0, str(Path(__file__).parent))
+import call_stack  # noqa: E402
 import config  # noqa: E402
 
 PERSONA = (config.ROOT / "lib" / "persona.txt").read_text()
@@ -320,10 +321,16 @@ async def main():
     browser = await pw.chromium.launch(headless=True, args=[
         "--no-sandbox",
         "--autoplay-policy=no-user-gesture-required",
-        "--use-fake-ui-for-media-stream"])
+        "--use-fake-ui-for-media-stream",
+        "--use-fake-device-for-media-stream"])
     page = await browser.new_page()
     await page.add_init_script(INIT_JS)
-    await page.goto("about:blank")
+    # getUserMedia needs a SECURE CONTEXT — serve a fake https page
+    async def _fake(route):
+        await route.fulfill(status=200, content_type="text/html",
+                            body="<html><body>aria</body></html>")
+    await page.route("https://aria.local/**", _fake)
+    await page.goto("https://aria.local/")
     r = await page.evaluate("window.__makeCall()")
     print(f"3. page pc: {r}")
     offer = None
@@ -354,7 +361,7 @@ async def main():
         r = await asyncio.to_thread(
             requests.post, f"{config.CALL}/start",
             headers=config.headers(at, {"Content-type": "application/json"}),
-            data=json.dumps(body), timeout=30)
+            data=json.dumps(body), timeout=60)
         print(f"4. call/start try {attempt+1} -> {r.status_code}")
         if r.status_code in (222, 500):
             await asyncio.sleep(5)
@@ -370,23 +377,53 @@ async def main():
     connected = False
     t0 = time.time()
     while time.time() - t0 < 90 and not connected:
-        if ch.new_msg.is_set():
-            ch.new_msg.clear()
-            while not ch.q.empty():
-                note = ch.q.get()
-                if not isinstance(note, dict):
+        # poll queue directly — ChromeChannel sets new_msg per note but a
+        # burst can set/clear between our iterations; drain regardless
+        while not ch.q.empty():
+            note = ch.q.get()
+            if isinstance(note, str):
+                try:
+                    note = json.loads(note)
+                except Exception:
                     continue
-                status = note.get("sessionStatusNotification")
-                if not status:
-                    continue
-                st = status.get("status")
-                rc = status.get("responseCode")
-                print(f"5. NOTIFICATION status={st!r} rc={rc} "
-                      f"sdp={'yes' if status.get('sdp') else 'no'}")
-                if st == "Connected" and rc == 200 and status.get("sdp"):
-                    answer_sdp = status["sdp"]
-                if st == "Terminated":
-                    print("   call terminated pre-ring")
+            if not isinstance(note, dict):
+                continue
+            status = note.get("sessionStatusNotification")
+            if not status:
+                continue
+            st = status.get("status")
+            rc = status.get("responseCode")
+            print(f"5. NOTIFICATION status={st!r} rc={rc} "
+                  f"sdp={'yes' if status.get('sdp') else 'no'}")
+            if st == "Connected" and rc == 200 and status.get("sdp"):
+                answer_sdp = status["sdp"]
+            elif st in ("ANSWERED", "Connected") and not status.get("sdp"):
+                # app flow (recon sendSdpAndStatus): POST /daas/call/status
+                # with our Connected/200; the RESPONSE body carries the
+                # remote answer SDP in receiverSessionStatus.sdp
+                ref = status.get("callObjectRef", "")
+                ref = ref.replace("/conference/", "/sessions/")
+                print(f"   [{st}] fetching answer via call/status...")
+                try:
+                    sr = await asyncio.to_thread(
+                        requests.post, f"{config.CALL}/status",
+                        headers=config.headers(
+                            at, {"Content-type": "application/json",
+                                 "callResourceUrl": ref}),
+                        data=json.dumps({"receiverSessionStatus": {
+                            "status": "Connected",
+                            "responseCode": "200"}}),
+                        timeout=20)
+                    print(f"   call/status -> {sr.status_code}")
+                    if sr.status_code in (200, 201, 202):
+                        d = sr.json().get("receiverSessionStatus", {})
+                        if d.get("sdp"):
+                            answer_sdp = d["sdp"]
+                            print("   answer SDP received via status POST")
+                except Exception as e:
+                    print(f"   status POST err: {e}")
+            if st == "Terminated":
+                print("   call terminated pre-ring")
         if answer_sdp:
             break
         await asyncio.sleep(0.3)
