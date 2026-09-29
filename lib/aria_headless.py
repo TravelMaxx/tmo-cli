@@ -261,6 +261,7 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                     try:
                         await conn.session.input_audio.append(
                             audio=b64mod.b64encode(payload).decode())
+                        state["pumped"] = state.get("pumped", 0) + len(payload)
                     except Exception as e:
                         evlog(f"HL_PUMP_ERR {str(e)[:120]}")
                         await asyncio.sleep(0.5)
@@ -504,6 +505,7 @@ async def main():
             d = json.loads(await page.evaluate(
                 "JSON.stringify(window.__callState)"))
             print(f"    ice={d['ice']} mic={d['mic']}B her={d['her']}B "
+                  f"pumped={state.get('pumped', 0)}B "
                   f"gpt={'ready' if state['gpt_ready'] else 'connecting'}")
         if state["gpt_error"]:
             print(f"[!] gpt: {state['gpt_error']}")
