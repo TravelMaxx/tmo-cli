@@ -302,7 +302,10 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                     event_id=f"ev_{uuid.uuid4().hex[:8]}",
                     session={
                         "model": "gpt-live-1",
-                        "instructions": PERSONA,
+                        "instructions": PERSONA + "\n\nGREETING: greet the "
+                        "caller immediately when the call connects — "
+                        "'Hey! I'm Aria, the personal assistant. How can I "
+                        "help?' — then pause and listen.",
                         "delegation": {"type": "client"},
                         "audio": {"format": {"type": "audio/pcmu", "rate": 8000},
                                   "output": {"voice": "marin"}},
@@ -328,59 +331,27 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                 # saw an end-of-turn, so she never spoke. Mic chunks drain
                 # continuously; silence fills only the gaps.
                 import base64 as b64mod
-                # CRITICAL: never append before session.start — OpenAI
-                # kills the whole connection ('The first Live event must
-                # be session.start'). Wait for recv() to finish starting.
-                t_wait = 0.0
+                # bare forwarder — the model has its own VAD and
+                # cadence handling; send mic bytes in order as they arrive
+                # (must not append before session.started or OpenAI drops
+                # the connection)
                 while not state.get("gpt_ready"):
                     await asyncio.sleep(0.05)
-                    t_wait += 0.05
-                    if t_wait > 20:
-                        evlog("PUMP_GAVE_UP_WAITING")
-                        return
-                evlog("PUMP_ARMED")
-                sent = 0
-                t_start = asyncio.get_event_loop().time()
                 greeted_seq = 0
                 while True:
-                    budget = int((asyncio.get_event_loop().time() - t_start) * 8000)
-                    room = budget - sent
-                    if room <= 0:
-                        await asyncio.sleep(0.02)
-                        continue
-                    chunk = None
                     try:
-                        chunk = q_in.get_nowait()
+                        chunk = q_in.get(timeout=1)
                     except Exception:
-                        pass
-                    if chunk is None:
-                        chunk = b"\xff" * min(800, room)
-                    payload = chunk[:room]
+                        continue
                     try:
                         await conn.session.input_audio.append(
-                            audio=b64mod.b64encode(payload).decode())
-                    except Exception:
-                        return
-                    sent += len(payload)
-                    # one-shot greeting once the session is up (proven
-                    # pattern from digits_gpt_call — she speaks only
-                    # after an explicit kickoff instruction)
-                    # per-call greeting: main loop bumps greet_seq on every
-                    # new grabbed call (daemon mode re-greets each call)
-                    if state.get("greet_seq", 0) > greeted_seq:
-                        greeted_seq = state["greet_seq"]
-                        try:
-                            await conn.session.instructions.append(
-                                event_id=f"go_{uuid.uuid4().hex[:6]}",
-                                delegation_id=None,
-                                content=("The call just connected — greet the "
-                                         "caller NOW, warmly and naturally: "
-                                         "'Hey! I'm Aria, the personal "
-                                         "assistant. How can I help?' Then "
-                                         "pause and listen."))
-                            evlog(f"GREETING_SENT seq={greeted_seq}")
-                        except Exception as e:
-                            evlog(f"GREETING_ERR {e}")
+                            audio=b64mod.b64encode(chunk).decode())
+                    except Exception as e:
+                        # never die silently — log and retry; a dead pump
+                        # is why she went deaf mid-call (mic flowed, GPT
+                        # got nothing, zero input transcripts)
+                        evlog(f"PUMP_APPEND_ERR {str(e)[:150]}")
+                        await asyncio.sleep(0.5)
 
             await asyncio.gather(recv(), pump())
 
@@ -520,8 +491,12 @@ async def main():
                         for b64 in json.loads(r):
                             f.write(base64.b64decode(b64))
                 mic_peak = 0
+                mic_acc = bytearray()   # batch to ~1600B: matches the
+                # proven replay chunk size (the 682B tap chunks may not
+                # survive the live append path)
                 for b64 in json.loads(r):
                     raw = base64.b64decode(b64)
+                    mic_acc.extend(raw)
                     # ulaw peak meter: 0x7f/0xff = silence, ~0x00/0x80 = loud
                     for b in raw:
                         v = ~b & 0xFF
@@ -529,7 +504,12 @@ async def main():
                         mag <<= (v & 0x70) >> 4
                         if mag > mic_peak:
                             mic_peak = mag
-                    q_in.put(raw)
+                    while len(mic_acc) >= 1600:
+                        q_in.put(bytes(mic_acc[:1600]))
+                        del mic_acc[:1600]
+                if mic_acc:
+                    q_in.put(bytes(mic_acc))
+                    mic_acc.clear()
                 if mic_peak:
                     state["mic_peak_max"] = max(state.get("mic_peak_max", 0),
                                                 mic_peak)
@@ -543,7 +523,7 @@ async def main():
                 import threading as _th
                 st = await eval_js(STATE_JS)
                 print(f"    mic_peak_max={state.get('mic_peak_max', 0)} "
-                      f"threads={_th.active_count()} gpt_ready={state.get('gpt_ready')} "
+                      f"gpt_ready={state.get('gpt_ready')} "
                       f"gpt_err={state.get('gpt_error')}")
             if state["gpt_error"] and not state["gpt_ready"]:
                 evlog(f"GPT_DIED {state['gpt_error']}")

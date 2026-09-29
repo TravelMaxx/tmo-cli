@@ -239,7 +239,6 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                 evlog("HL_PUMP_ARMED")
                 sent = 0
                 t_start = asyncio.get_event_loop().time()
-                greeted = False
                 while True:
                     budget = int((asyncio.get_event_loop().time() - t_start)
                                   * 8000)
@@ -261,20 +260,6 @@ def start_gpt(q_in: SimpleQueue, q_out: SimpleQueue, state: dict):
                     except Exception:
                         return
                     sent += len(payload)
-                    if not greeted:
-                        greeted = True
-                        try:
-                            await conn.session.instructions.append(
-                                event_id=f"go_{uuid.uuid4().hex[:6]}",
-                                delegation_id=None,
-                                content=("The call just connected — greet the "
-                                         "caller NOW, warmly and naturally: "
-                                         "'Hey! I'm Aria, the personal "
-                                         "assistant. How can I help?' Then "
-                                         "pause and listen."))
-                            evlog("HL_GREETING_SENT")
-                        except Exception as e:
-                            evlog(f"HL_GREETING_ERR {e}")
 
             await asyncio.gather(recv(), pump())
 
@@ -403,7 +388,7 @@ async def main():
                 # later Connected/rc=200 notification carries no SDP
                 answer_sdp = status["sdp"]
                 print("   using rc=183 early-media SDP as the answer")
-            if st == "Connected" and rc == 200 and status.get("sdp"):
+            if st == "Connected" and str(rc) == "200" and status.get("sdp"):
                 answer_sdp = status["sdp"]
             elif st in ("ANSWERED", "Connected") and not status.get("sdp"):
                 # app flow (recon sendSdpAndStatus): POST /daas/call/status
@@ -444,8 +429,14 @@ async def main():
         fixed = call_stack.aiortc_answer(answer_sdp, offer)
     except Exception:
         fixed = answer_sdp
-    r = await page.evaluate(
-        f"window.__applyAnswer({json.dumps(fixed)})")
+    # timeout-wrapped: setRemoteDescription hung once (promise never
+    # resolved) and burned GV's whole screening window
+    try:
+        r = await asyncio.wait_for(
+            page.evaluate(f"window.__applyAnswer({json.dumps(fixed)})"),
+            timeout=8)
+    except asyncio.TimeoutError:
+        raise SystemExit("[!] answer apply hung (setRemoteDescription)")
     print(f"6. {r} — chrome-native ICE/DTLS negotiating")
     for _ in range(60):
         d = json.loads(await page.evaluate(
